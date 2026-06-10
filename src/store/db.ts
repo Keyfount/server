@@ -4,7 +4,7 @@
  * Fastify's event loop instead of a pool.
  */
 import Database, { type Database as DB } from "better-sqlite3";
-import { readdirSync, readFileSync } from "node:fs";
+import { chmodSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -18,6 +18,19 @@ export interface Store {
 
 export function openStore(databasePath: string): Store {
   const db = new Database(databasePath);
+  // Restrict the DB file to its owner. It holds linkable metadata
+  // (email_hash, device labels, IP HMACs, the OPRF seed + AKE keypair), so
+  // on a shared host or a loose bind-mount it must not be world-readable.
+  // The -wal/-shm siblings are gated by the data dir's 0700 mode (set when
+  // the dir is created in buildServices). Best effort: :memory: has no file
+  // and some filesystems reject chmod.
+  if (databasePath !== ":memory:") {
+    try {
+      chmodSync(databasePath, 0o600);
+    } catch {
+      /* non-POSIX or read-only mount: fall back to the dir's protection */
+    }
+  }
   db.pragma("journal_mode = WAL");
   db.pragma("synchronous = NORMAL");
   db.pragma("foreign_keys = ON");
@@ -36,16 +49,19 @@ export function openStore(databasePath: string): Store {
  */
 export function migrate(db: DB, migrationsDir?: string): { applied: number[] } {
   // dist/store/db.js → ../../migrations
-  const dir = migrationsDir ?? path.resolve(__dirname, "..", "..", "migrations");
+  const dir =
+    migrationsDir ?? path.resolve(__dirname, "..", "..", "migrations");
 
   db.exec(
     "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL) STRICT",
   );
 
   const already = new Set<number>(
-    (db.prepare("SELECT version FROM schema_migrations").all() as { version: number }[]).map(
-      (r) => r.version,
-    ),
+    (
+      db.prepare("SELECT version FROM schema_migrations").all() as {
+        version: number;
+      }[]
+    ).map((r) => r.version),
   );
 
   const files = readdirSync(dir)
