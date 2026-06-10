@@ -76,6 +76,7 @@ export async function buildServices(
   if (config.databasePath !== ":memory:") {
     mkdirSync(path.dirname(path.resolve(config.databasePath)), {
       recursive: true,
+      mode: 0o700,
     });
   }
   const store = openStore(config.databasePath);

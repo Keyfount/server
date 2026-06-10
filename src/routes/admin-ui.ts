@@ -54,6 +54,9 @@ export async function adminUiRoutes(app: FastifyInstance): Promise<void> {
     decorateReply: false,
     cacheControl: true,
     maxAge: 60_000,
+    // Defense in depth: never serve dotfiles from the static root, even if
+    // a build step or operator accidentally drops one in.
+    dotfiles: "deny",
     // Auto-serves index.html when the user hits "/".
     index: "index.html",
   });
@@ -61,7 +64,12 @@ export async function adminUiRoutes(app: FastifyInstance): Promise<void> {
   app.addHook("onSend", async (req, reply, payload) => {
     if (req.method !== "GET") return payload;
     const url = req.url.split("?")[0] ?? "";
-    if (url === "/" || url === "/index.html" || url === "/admin.js" || url === "/admin.css") {
+    if (
+      url === "/" ||
+      url === "/index.html" ||
+      url === "/admin.js" ||
+      url === "/admin.css"
+    ) {
       reply.header("content-security-policy", SPA_RELAXED_CSP);
     }
     return payload;
