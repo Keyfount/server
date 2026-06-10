@@ -22,6 +22,10 @@ import type { SessionService } from "../auth/sessions.js";
 import type { AdminRepo } from "../store/admins.js";
 import type { AuditLogger } from "../store/audit.js";
 import { hmacIp } from "../crypto/hmac.js";
+import {
+  UNKNOWN_ACCOUNT_KEY,
+  type LoginRateLimiter,
+} from "../auth/ratelimit.js";
 
 export interface AdminDeps {
   opaque: OpaqueService;
@@ -33,6 +37,10 @@ export interface AdminDeps {
   userSessions: SessionService;
   challenges: AdminChallengeService;
   audit: AuditLogger;
+  /** Shared login rate limiter. The admin credential is the highest-value
+   * account on the instance, so its login gets the same brute-force
+   * protection the user side already has. */
+  rateLimit: LoginRateLimiter;
   hmacKey: Buffer;
 }
 
@@ -58,7 +66,10 @@ function credentialId(username: string): string {
 }
 
 function requireAdmin(sessions: AdminSessionService) {
-  return async function (req: FastifyRequest, reply: FastifyReply): Promise<void> {
+  return async function (
+    req: FastifyRequest,
+    reply: FastifyReply,
+  ): Promise<void> {
     const header = req.headers["authorization"];
     if (typeof header !== "string" || !header.startsWith("Bearer ")) {
       void reply.code(401).send({ error: "unauthorized" });
@@ -74,7 +85,10 @@ function requireAdmin(sessions: AdminSessionService) {
   };
 }
 
-export async function adminRoutes(app: FastifyInstance, deps: AdminDeps): Promise<void> {
+export async function adminRoutes(
+  app: FastifyInstance,
+  deps: AdminDeps,
+): Promise<void> {
   const requireAuth = requireAdmin(deps.sessions);
 
   // --- GET /admin/state ----------------------------------------------------
@@ -176,6 +190,20 @@ export async function adminRoutes(app: FastifyInstance, deps: AdminDeps): Promis
     },
     async (req, reply) => {
       const admin = deps.admins.findByUsername(req.body.username);
+
+      // Brute-force protection, mirroring the user login path: key on the
+      // admin id when known (else a shared unknown bucket) plus the client
+      // IP, and check before the costly OPAQUE work.
+      const ipHash = hmacIp(req.ip, deps.hmacKey);
+      const accountKey = admin ? admin.id : UNKNOWN_ACCOUNT_KEY;
+      const rate = deps.rateLimit.check(accountKey, ipHash);
+      if (!rate.allowed) {
+        return reply
+          .code(429)
+          .header("Retry-After", Math.ceil(rate.retryAfterMs / 1000))
+          .send({ error: "too_many_attempts" });
+      }
+
       let record;
       let isDummy = false;
       if (admin) {
@@ -218,18 +246,23 @@ export async function adminRoutes(app: FastifyInstance, deps: AdminDeps): Promis
       },
     },
     async (req, reply) => {
+      const ipHash = hmacIp(req.ip, deps.hmacKey);
       const challenge = deps.challenges.consume(req.body.challengeToken);
       if (!challenge) {
         return reply.code(401).send({ error: "invalid_login" });
       }
+      const accountKey = challenge.adminId ?? UNKNOWN_ACCOUNT_KEY;
       let success = false;
       try {
-        const expected = deps.opaque.deserializeExpected(challenge.expectedBlob);
+        const expected = deps.opaque.deserializeExpected(
+          challenge.expectedBlob,
+        );
         deps.opaque.authFinish(req.body.ke3, expected);
         success = !challenge.isDummy;
       } catch {
         success = false;
       }
+      deps.rateLimit.record(accountKey, ipHash, success);
       if (!success || !challenge.adminId) {
         deps.audit.log({
           action: "login_failure",
@@ -242,7 +275,10 @@ export async function adminRoutes(app: FastifyInstance, deps: AdminDeps): Promis
       deps.audit.log({
         action: "login_success",
         ipHash: hmacIp(req.ip, deps.hmacKey),
-        metadata: { actor: "admin", admin_id: challenge.adminId.toString("hex") },
+        metadata: {
+          actor: "admin",
+          admin_id: challenge.adminId.toString("hex"),
+        },
       });
       return reply.send({
         adminId: challenge.adminId.toString("hex"),
@@ -253,20 +289,27 @@ export async function adminRoutes(app: FastifyInstance, deps: AdminDeps): Promis
   );
 
   // --- POST /admin/auth/logout ---------------------------------------------
-  app.post("/admin/auth/logout", { preHandler: requireAuth }, async (req, reply) => {
-    const header = req.headers["authorization"];
-    if (typeof header === "string" && header.startsWith("Bearer ")) {
-      deps.sessions.revoke(header.slice("Bearer ".length).trim());
-    }
-    return reply.send({ ok: true });
-  });
+  app.post(
+    "/admin/auth/logout",
+    { preHandler: requireAuth },
+    async (req, reply) => {
+      const header = req.headers["authorization"];
+      if (typeof header === "string" && header.startsWith("Bearer ")) {
+        deps.sessions.revoke(header.slice("Bearer ".length).trim());
+      }
+      return reply.send({ ok: true });
+    },
+  );
 
   // --- GET /admin/me -------------------------------------------------------
   // Sanity probe used by the web UI to detect a still-valid session.
   app.get("/admin/me", { preHandler: requireAuth }, async (req, reply) => {
     const admin = deps.admins.findById(req.admin!.adminId);
     if (!admin) return reply.code(401).send({ error: "unauthorized" });
-    return reply.send({ adminId: admin.id.toString("hex"), username: admin.username });
+    return reply.send({
+      adminId: admin.id.toString("hex"),
+      username: admin.username,
+    });
   });
 
   // --- GET /admin/users/pending --------------------------------------------
@@ -389,7 +432,10 @@ export async function adminRoutes(app: FastifyInstance, deps: AdminDeps): Promis
         querystring: cast({
           type: "object",
           properties: {
-            status: { type: "string", enum: ["all", "pending", "approved", "rejected"] },
+            status: {
+              type: "string",
+              enum: ["all", "pending", "approved", "rejected"],
+            },
             limit: { type: "string", pattern: "^[0-9]+$" },
             offset: { type: "string", pattern: "^[0-9]+$" },
           },
@@ -401,10 +447,14 @@ export async function adminRoutes(app: FastifyInstance, deps: AdminDeps): Promis
       const filter = (req.query.status ?? "all") as UserListFilter;
       const limit = Math.min(
         500,
-        req.query.limit !== undefined ? Number.parseInt(req.query.limit, 10) : 100,
+        req.query.limit !== undefined
+          ? Number.parseInt(req.query.limit, 10)
+          : 100,
       );
       const offset =
-        req.query.offset !== undefined ? Number.parseInt(req.query.offset, 10) : 0;
+        req.query.offset !== undefined
+          ? Number.parseInt(req.query.offset, 10)
+          : 0;
       const rows = deps.users.listUsers(filter, limit, offset);
       const total = deps.users.countUsers(filter);
       return reply.send({
@@ -419,7 +469,9 @@ export async function adminRoutes(app: FastifyInstance, deps: AdminDeps): Promis
           createdAt: u.createdAt,
           decidedAt: u.approvalDecidedAt,
           lastSeenAt: u.lastSeenAt,
-          ...(u.rejectionReason !== null ? { rejectionReason: u.rejectionReason } : {}),
+          ...(u.rejectionReason !== null
+            ? { rejectionReason: u.rejectionReason }
+            : {}),
         })),
       });
     },

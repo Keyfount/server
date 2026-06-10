@@ -20,10 +20,22 @@ import { mkdirSync } from "node:fs";
 import path from "node:path";
 
 import { createOpaqueService, type OpaqueService } from "./auth/opaque.js";
-import { createAdminChallengeService, type AdminChallengeService } from "./auth/admin-challenges.js";
-import { createAdminSessionService, type AdminSessionService } from "./auth/admin-sessions.js";
-import { createChallengeService, type ChallengeService } from "./auth/challenges.js";
-import { createLoginRateLimiter, type LoginRateLimiter } from "./auth/ratelimit.js";
+import {
+  createAdminChallengeService,
+  type AdminChallengeService,
+} from "./auth/admin-challenges.js";
+import {
+  createAdminSessionService,
+  type AdminSessionService,
+} from "./auth/admin-sessions.js";
+import {
+  createChallengeService,
+  type ChallengeService,
+} from "./auth/challenges.js";
+import {
+  createLoginRateLimiter,
+  type LoginRateLimiter,
+} from "./auth/ratelimit.js";
 import { createSessionService, type SessionService } from "./auth/sessions.js";
 import type { Config } from "./config/env.js";
 import { adminRoutes } from "./routes/admin.js";
@@ -62,7 +74,9 @@ export async function buildServices(
   options: AppOptions = {},
 ): Promise<Services> {
   if (config.databasePath !== ":memory:") {
-    mkdirSync(path.dirname(path.resolve(config.databasePath)), { recursive: true });
+    mkdirSync(path.dirname(path.resolve(config.databasePath)), {
+      recursive: true,
+    });
   }
   const store = openStore(config.databasePath);
   migrate(store.db, options.migrationsDir);
@@ -163,7 +177,10 @@ export async function buildApp(
       });
     });
     await app.register(async (instance) => {
-      await syncRoutes(instance, { sync: services.sync, sessions: services.sessions });
+      await syncRoutes(instance, {
+        sync: services.sync,
+        sessions: services.sessions,
+      });
     });
   }
 
@@ -177,6 +194,7 @@ export async function buildApp(
         userSessions: services.sessions,
         challenges: services.adminChallenges,
         audit: services.audit,
+        rateLimit: services.rateLimitLogin,
         hmacKey: config.serverHmacKey,
       });
     });
@@ -191,7 +209,7 @@ export async function buildApp(
 
   // Expose the raw DB handle for integration tests. Production paths
   // never read this property.
-   
+
   (app as any).__store_db = services.store.db;
 
   // Each instance owns its own purge timer when the services are

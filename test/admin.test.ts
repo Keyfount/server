@@ -88,10 +88,46 @@ async function adminLogin(
   const fin = await app.inject({
     method: "POST",
     url: "/admin/auth/login/finish",
-    payload: { challengeToken: startBody.challengeToken, ke3: finResult.ke3.serialize() },
+    payload: {
+      challengeToken: startBody.challengeToken,
+      ke3: finResult.ke3.serialize(),
+    },
   });
   expect(fin.statusCode).toBe(200);
   return (fin.json() as { sessionToken: string }).sessionToken;
+}
+
+/** Drive a failed admin login (wrong password) end to end and return the
+ * status of the call that failed, so a test can assert the lockout. */
+async function failedAdminLogin(
+  app: FastifyInstance,
+  username: string,
+  wrongPassword: string,
+): Promise<number> {
+  const client = new OpaqueClient(opaqueConfig);
+  const ke1 = await client.authInit(wrongPassword);
+  if (ke1 instanceof Error) throw ke1;
+  const start = await app.inject({
+    method: "POST",
+    url: "/admin/auth/login/start",
+    payload: { username, ke1: ke1.serialize() },
+  });
+  if (start.statusCode !== 200) return start.statusCode;
+  const startBody = start.json() as { ke2: number[]; challengeToken: string };
+  const fin = await client.authFinish(
+    KE2.deserialize(opaqueConfig, startBody.ke2),
+    "keyfount-server",
+  );
+  const ke3 =
+    fin instanceof Error
+      ? new Array(opaqueConfig.mac.Nm).fill(0)
+      : fin.ke3.serialize();
+  const finRes = await app.inject({
+    method: "POST",
+    url: "/admin/auth/login/finish",
+    payload: { challengeToken: startBody.challengeToken, ke3 },
+  });
+  return finRes.statusCode;
 }
 
 async function userRegister(
@@ -148,7 +184,11 @@ describe("admin + approval workflow", () => {
     });
 
     it("creates the first admin and returns a session", async () => {
-      const { adminId, sessionToken } = await setupAdmin(app, "root", "pw-very-strong-1");
+      const { adminId, sessionToken } = await setupAdmin(
+        app,
+        "root",
+        "pw-very-strong-1",
+      );
       expect(adminId).toMatch(/^[0-9a-f]{32}$/);
       expect(sessionToken).toMatch(/^[A-Za-z0-9_-]+$/);
       const after = await app.inject({ method: "GET", url: "/admin/state" });
@@ -194,7 +234,10 @@ describe("admin + approval workflow", () => {
         url: "/admin/auth/login/start",
         payload: { username: "root", ke1: ke1.serialize() },
       });
-      const startBody = start.json() as { ke2: number[]; challengeToken: string };
+      const startBody = start.json() as {
+        ke2: number[];
+        challengeToken: string;
+      };
       const fin = await client.authFinish(
         KE2.deserialize(opaqueConfig, startBody.ke2),
         "keyfount-server",
@@ -212,6 +255,23 @@ describe("admin + approval workflow", () => {
       });
       expect(finRes.statusCode).toBe(401);
       expect(finRes.json()).toEqual({ error: "invalid_login" });
+    });
+
+    it("rate-limits admin login after five failed attempts", async () => {
+      for (let i = 0; i < 5; i++) {
+        expect(await failedAdminLogin(app, "root", `wrong-${i}`)).toBe(401);
+      }
+      // The sixth attempt is blocked at /start before any OPAQUE work.
+      const client = new OpaqueClient(opaqueConfig);
+      const ke1 = await client.authInit("wrong-again");
+      if (ke1 instanceof Error) throw ke1;
+      const start = await app.inject({
+        method: "POST",
+        url: "/admin/auth/login/start",
+        payload: { username: "root", ke1: ke1.serialize() },
+      });
+      expect(start.statusCode).toBe(429);
+      expect(start.headers["retry-after"]).toBeDefined();
     });
 
     it("rejects /admin/me without a session", async () => {
@@ -241,7 +301,11 @@ describe("admin + approval workflow", () => {
     });
 
     it("approving a pending user transitions /auth/approval-status to approved", async () => {
-      const { userId } = await userRegister(app, "bob@example.com", "his-master");
+      const { userId } = await userRegister(
+        app,
+        "bob@example.com",
+        "his-master",
+      );
       let status = await app.inject({
         method: "GET",
         url: `/auth/approval-status/${userId}`,
@@ -265,7 +329,11 @@ describe("admin + approval workflow", () => {
     });
 
     it("rejecting a user surfaces the reason on /auth/approval-status", async () => {
-      const { userId } = await userRegister(app, "carl@example.com", "his-master");
+      const { userId } = await userRegister(
+        app,
+        "carl@example.com",
+        "his-master",
+      );
       const reject = await app.inject({
         method: "POST",
         url: `/admin/users/${userId}/reject`,
@@ -303,7 +371,10 @@ describe("admin + approval workflow", () => {
         url: "/auth/opaque/login/start",
         payload: { email: "dave@example.com", ke1: ke1.serialize() },
       });
-      const startBody = start.json() as { ke2: number[]; challengeToken: string };
+      const startBody = start.json() as {
+        ke2: number[];
+        challengeToken: string;
+      };
       const fin = await client.authFinish(
         KE2.deserialize(opaqueConfig, startBody.ke2),
         "keyfount-server",
@@ -319,7 +390,9 @@ describe("admin + approval workflow", () => {
         },
       });
       expect(finRes.statusCode).toBe(403);
-      expect((finRes.json() as { error: string }).error).toBe("pending_approval");
+      expect((finRes.json() as { error: string }).error).toBe(
+        "pending_approval",
+      );
     });
   });
 
@@ -361,7 +434,10 @@ describe("admin + approval workflow", () => {
         url: "/admin/users?status=approved",
         headers: { authorization: `Bearer ${token}` },
       });
-      const body = r.json() as { total: number; users: { id: string; status: string }[] };
+      const body = r.json() as {
+        total: number;
+        users: { id: string; status: string }[];
+      };
       expect(body.total).toBe(1);
       expect(body.users[0]!.id).toBe(userId);
       expect(body.users[0]!.status).toBe("approved");
@@ -386,7 +462,9 @@ describe("admin + approval workflow", () => {
         url: "/admin/users?status=rejected",
         headers: { authorization: `Bearer ${token}` },
       });
-      const body = after.json() as { users: { id: string; rejectionReason?: string }[] };
+      const body = after.json() as {
+        users: { id: string; rejectionReason?: string }[];
+      };
       expect(body.users).toHaveLength(1);
       expect(body.users[0]!.rejectionReason).toBe("ne devrait pas être là");
     });
