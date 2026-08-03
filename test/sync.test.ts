@@ -197,6 +197,82 @@ describe("sync events + snapshots", () => {
     });
   });
 
+  // The relay is zero-knowledge: every payload is an opaque client-side
+  // AES-GCM ciphertext. The cross-repo `linkedDomains` feature changes the
+  // *plaintext* shape clients encrypt, so by design the relay needs no code
+  // change — these tests codify that invariant so a regression that made the
+  // relay inspect or size-reject array-bearing payloads can't pass silently.
+  // See Keyfount/desktop#72 and Keyfount/extension#91.
+  describe("linkedDomains payload — zero-knowledge non-regression (#38)", () => {
+    let token: string;
+
+    beforeEach(async () => {
+      await app.close();
+      app = await buildApp(testConfig(), { migrationsDir: MIGRATIONS_DIR });
+      token = await registerAndLogin(app, `ld-${Math.random()}@example.com`, "pw");
+    });
+
+    async function pushBytes(ciphertext: number[], lamport: number) {
+      const r = await app.inject({
+        method: "POST",
+        url: "/events",
+        headers: { authorization: `Bearer ${token}` },
+        payload: { lamport, ciphertext, nonce: Array.from(randomBytes(12)) },
+      });
+      return { status: r.statusCode, body: r.json() as Record<string, unknown> };
+    }
+
+    async function pullAll(): Promise<{ ciphertext: number[]; serverSeq: number }[]> {
+      const r = await app.inject({
+        method: "GET",
+        url: "/events",
+        headers: { authorization: `Bearer ${token}` },
+      });
+      return (r.json() as { events: { ciphertext: number[]; serverSeq: number }[] }).events;
+    }
+
+    it("round-trips an opaque linkedDomains-bearing payload byte-for-byte", async () => {
+      // Stand-in for the ciphertext bytes a client produces by AES-GCM-
+      // encrypting an `upsert_account` op whose entry carries linkedDomains.
+      // The relay never decrypts it — the contract is "same bytes back".
+      const opaque = Array.from(
+        new TextEncoder().encode(
+          JSON.stringify({
+            t: "upsert_account",
+            entry: {
+              domain: "w.example.com",
+              username: "u@example.com",
+              linkedDomains: ["z.example.com", "other-site.com"],
+              profile: { mode: "random", length: 16, counter: 1 },
+              createdAt: 1,
+              lastUsedAt: 2,
+            },
+          }),
+        ),
+      );
+      const push = await pushBytes(opaque, 1);
+      expect(push.status).toBe(200);
+
+      const events = await pullAll();
+      expect(events).toHaveLength(1);
+      expect(events[0]!.ciphertext).toEqual(opaque);
+    });
+
+    it("round-trips a larger ciphertext (extra linked domains) unchanged", async () => {
+      const size = Math.min(4096, SYNC_LIMITS.maxEventBytes - 1);
+      const big = Array.from(randomBytes(size));
+      expect(big.length).toBeLessThan(SYNC_LIMITS.maxEventBytes);
+
+      const push = await pushBytes(big, 1);
+      expect(push.status).toBe(200);
+
+      const events = await pullAll();
+      expect(events).toHaveLength(1);
+      expect(events[0]!.ciphertext).toEqual(big);
+      expect(events[0]!.ciphertext).toHaveLength(size);
+    });
+  });
+
   describe("snapshots", () => {
     let token: string;
 
